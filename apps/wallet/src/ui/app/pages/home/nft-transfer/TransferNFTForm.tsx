@@ -37,11 +37,9 @@ export function TransferNFTForm({
 	const navigate = useNavigate();
 	const { clientIdentifier, notificationModal } = useQredoTransaction();
 
-	const kioskContents = useGetKioskContents(activeAddress);
+	const { data: kiosk } = useGetKioskContents(activeAddress);
 	const transferKioskItem = useTransferKioskItem({ objectId, objectType });
-	const isContainedInKiosk = kioskContents?.data?.some(
-		(kioskItem) => kioskItem.data?.objectId === objectId,
-	);
+	const isContainedInKiosk = kiosk?.list.some((kioskItem) => kioskItem.data?.objectId === objectId);
 
 	const transferNFT = useMutation({
 		mutationFn: async (to: string) => {
