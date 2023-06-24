@@ -4,9 +4,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::future::join_all;
-use indexmap::IndexMap;
 use move_core_types::ident_str;
-use prometheus::Registry;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,17 +12,18 @@ use std::{
     time::{Duration, Instant},
 };
 use sui_core::{
-    authority::AuthorityStore,
-    authority_aggregator::{AuthAggMetrics, AuthorityAggregator},
+    authority::AuthorityStore, authority_aggregator::AuthorityAggregator,
     safe_client::SafeClientMetricsBase,
 };
 use sui_node::SuiNodeHandle;
 
 use sui_core::authority::AuthorityState;
-use sui_types::effects::{CertifiedTransactionEffects, TransactionEffects, TransactionEffectsAPI};
+use sui_swarm_config::genesis_config::{AccountConfig, DEFAULT_GAS_AMOUNT};
+use sui_test_transaction_builder::TestTransactionBuilder;
+use sui_types::effects::{TransactionEffects, TransactionEffectsAPI};
 use sui_types::{
     base_types::{ObjectID, ObjectRef, SuiAddress},
-    crypto::{get_key_pair, AccountKeyPair},
+    crypto::AccountKeyPair,
     object::{Object, Owner},
     programmable_transaction_builder::ProgrammableTransactionBuilder,
     storage::ObjectStore,
@@ -38,14 +37,12 @@ use sui_types::{
     utils::to_sender_signed_transaction,
     SUI_SYSTEM_PACKAGE_ID,
 };
-use test_utils::authority::spawn_test_authorities;
-use test_utils::authority::test_authority_configs_with_objects;
+use test_utils::network::{TestCluster, TestClusterBuilder};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
 const MAX_DELEGATION_AMOUNT: u64 = 10_000_000_000;
 const MIN_DELEGATION_AMOUNT: u64 = 1_000_000_000;
-const MAX_GAS: u64 = 100_000_000;
 
 macro_rules! move_call {
     {$builder:expr, ($addr:expr)::$module_name:ident::$func:ident($($args:expr),* $(,)?)} => {
@@ -82,8 +79,8 @@ trait StatePredicate {
 #[allow(dead_code)]
 struct StressTestRunner {
     pub post_epoch_predicates: Vec<Box<dyn StatePredicate + Send + Sync>>,
-    pub nodes: Vec<SuiNodeHandle>,
-    pub accounts: IndexMap<SuiAddress, (AccountKeyPair, ObjectID)>,
+    pub test_cluster: TestCluster,
+    pub accounts: Vec<SuiAddress>,
     pub active_validators: BTreeSet<SuiAddress>,
     pub preactive_validators: BTreeMap<SuiAddress, u64>,
     pub removed_validators: BTreeSet<SuiAddress>,
@@ -96,23 +93,21 @@ struct StressTestRunner {
 
 impl StressTestRunner {
     pub async fn new() -> Self {
-        // let authority_state = init_state().await;
-        let mut accounts = IndexMap::new();
-        let mut objects = vec![];
-        for _ in 0..100 {
-            let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
-            let gas_object_id = ObjectID::random();
-            let gas_object = Object::with_id_owner_for_testing(gas_object_id, sender);
-            objects.push(gas_object);
-            // authority_state.insert_genesis_object(gas_object).await;
-            accounts.insert(sender, (sender_key, gas_object_id));
-        }
-        let (net_config, _) = test_authority_configs_with_objects(objects);
-        let nodes = spawn_test_authorities(&net_config).await;
+        let test_cluster = TestClusterBuilder::new()
+            .with_accounts(vec![
+                AccountConfig {
+                    gas_amounts: vec![DEFAULT_GAS_AMOUNT],
+                    address: None,
+                };
+                100
+            ])
+            .build()
+            .await;
+        let accounts = test_cluster.wallet.get_addresses();
         Self {
             post_epoch_predicates: vec![],
+            test_cluster,
             accounts,
-            nodes,
             active_validators: BTreeSet::new(),
             preactive_validators: BTreeMap::new(),
             removed_validators: BTreeSet::new(),
@@ -125,20 +120,17 @@ impl StressTestRunner {
     }
 
     pub fn pick_random_sender(&mut self) -> SuiAddress {
-        *self
-            .accounts
-            .get_index(self.rng.gen_range(0..self.accounts.len()))
-            .unwrap()
-            .0
+        self.accounts[self.rng.gen_range(0..self.accounts.len())]
     }
 
     pub fn system_state(&self) -> SuiSystemStateSummary {
-        self.nodes[0].with(|node| {
-            node.state()
-                .get_sui_system_state_object_for_testing()
-                .unwrap()
-                .into_sui_system_state_summary()
-        })
+        self.test_cluster
+            .fullnode_handle
+            .sui_node
+            .state()
+            .get_sui_system_state_object_for_testing()
+            .unwrap()
+            .into_sui_system_state_summary()
     }
 
     pub fn pick_random_active_validator(&mut self) -> SuiValidatorSummary {
@@ -150,102 +142,35 @@ impl StressTestRunner {
             .clone()
     }
 
-    async fn execute_transaction_block(
-        &self,
-        transaction: VerifiedTransaction,
-    ) -> anyhow::Result<CertifiedTransactionEffects> {
-        let registry = Registry::new();
-        let net = AuthorityAggregator::new_from_local_system_state(
-            &self.nodes[0].with(|node| node.state().db()),
-            &self.nodes[0].with(|node| node.state().committee_store().clone()),
-            SafeClientMetricsBase::new(&registry),
-            AuthAggMetrics::new(&registry),
-        )
-        .unwrap();
-        net.execute_transaction_block(&transaction)
+    pub async fn run(&self, sender: SuiAddress, pt: ProgrammableTransaction) -> TransactionEffects {
+        let rgp = self.test_cluster.get_reference_gas_price().await;
+        let gas_object = self
+            .test_cluster
+            .wallet
+            .get_one_gas_object_owned_by_address(sender)
             .await
-            .map(|e| e.into_inner())
-    }
-
-    async fn trigger_reconfiguration(authorities: &[SuiNodeHandle]) {
-        info!("Starting reconfiguration");
-        let start = Instant::now();
-
-        // Close epoch on 2f+1 validators.
-        let cur_committee =
-            authorities[0].with(|node| node.state().epoch_store_for_testing().committee().clone());
-        let mut cur_stake = 0;
-        for handle in authorities {
-            handle
-                .with_async(|node| async {
-                    node.close_epoch_for_testing().await.unwrap();
-                    cur_stake += cur_committee.weight(&node.state().name);
-                })
-                .await;
-            if cur_stake >= cur_committee.quorum_threshold() {
-                break;
-            }
-        }
-        info!("close_epoch complete after {:?}", start.elapsed());
-
-        // Wait for all nodes to reach the next epoch.
-        let handles: Vec<_> = authorities
-            .iter()
-            .map(|handle| {
-                handle.with_async(|node| async {
-                    let mut retries = 0;
-                    loop {
-                        if node.state().epoch_store_for_testing().epoch() == cur_committee.epoch + 1 {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        retries += 1;
-                        if retries % 5 == 0 {
-                            warn!(validator=?node.state().name.concise(), "Waiting for {:?} seconds for epoch change", retries);
-                        }
-                    }
-                })
-            })
-        .collect();
-
-        timeout(Duration::from_secs(40), join_all(handles))
-            .await
-            .expect("timed out waiting for reconfiguration to complete");
-
-        info!("reconfiguration complete after {:?}", start.elapsed());
-    }
-
-    pub async fn run(
-        &mut self,
-        sender: SuiAddress,
-        pt: ProgrammableTransaction,
-    ) -> TransactionEffects {
-        let (sender_key, gas_object_id) = self.accounts.get(&sender).unwrap();
-        let (gas_object_ref, rgp) = self.nodes[0].with(|node| {
-            let gas_object = node
-                .state()
-                .db()
-                .get_object(gas_object_id)
-                .unwrap()
-                .unwrap();
-            let rgp = node.reference_gas_price_for_testing().unwrap();
-            (gas_object.compute_object_reference(), rgp)
-        });
-        let signed_txn = to_sender_signed_transaction(
-            TransactionData::new_programmable(sender, vec![gas_object_ref], pt, MAX_GAS, rgp),
-            sender_key,
+            .unwrap()
+            .unwrap();
+        let transaction = self.test_cluster.wallet.sign_transaction(
+            &TestTransactionBuilder::new(sender, gas_object, rgp)
+                .programmable(pt)
+                .build(),
         );
+        let (effects, _, _) = self
+            .test_cluster
+            .execute_transaction_return_raw_effects(transaction)
+            .await
+            .unwrap();
 
-        let effects = self.execute_transaction_block(signed_txn).await.unwrap();
         assert!(effects.status().is_ok());
-        effects.into_data()
+        effects
     }
 
     // Useful for debugging and the like
     pub fn display_effects(&self, effects: &TransactionEffects) {
         let TransactionEffects::V1(effects) = effects;
         println!("CREATED:");
-        self.nodes[0].with(|node| {
+        self.test_cluster.fullnode_handle.sui_node.with(|node| {
             let state = node.state();
             let epoch_store = state.load_epoch_store_one_call_per_task();
             let mut layout_resolver = epoch_store
@@ -291,17 +216,17 @@ impl StressTestRunner {
         })
     }
 
-    pub async fn db(&self) -> Arc<AuthorityStore> {
-        self.nodes[0].with(|node| node.state().db())
+    pub fn db(&self) -> Arc<AuthorityStore> {
+        self.state().db()
     }
 
-    pub async fn state(&self) -> Arc<AuthorityState> {
-        self.nodes[0].with(|node| node.state())
+    pub fn state(&self) -> Arc<AuthorityState> {
+        self.test_cluster.fullnode_handle.sui_node.state()
     }
 
-    pub async fn change_epoch(&mut self) {
+    pub async fn change_epoch(&self) {
         let pre_state_summary = self.system_state();
-        Self::trigger_reconfiguration(&self.nodes).await;
+        self.test_cluster.trigger_reconfiguration().await;
         let post_state_summary = self.system_state();
         info!(
             "Changing epoch form {} to {}",
@@ -334,7 +259,7 @@ impl StressTestRunner {
     }
 
     async fn get_from_effects(&self, effects: &[(ObjectRef, Owner)], name: &str) -> Option<Object> {
-        let db = self.db().await;
+        let db = self.db();
         let found: Vec<_> = effects
             .iter()
             .filter_map(|(obj_ref, _)| {
@@ -414,8 +339,8 @@ mod add_stake {
                 .get_created_object_of_type_name(effects, "StakedSui")
                 .await
                 .unwrap();
-            let store = runner.db().await;
-            let state = runner.state().await;
+            let store = runner.db();
+            let state = runner.state();
             let epoch_store = state.load_epoch_store_one_call_per_task();
             let mut layout_resolver = epoch_store
                 .executor()
